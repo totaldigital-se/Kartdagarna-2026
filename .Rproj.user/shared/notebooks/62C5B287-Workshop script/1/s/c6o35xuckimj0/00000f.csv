@@ -1,0 +1,6 @@
+"0","plot(pred,"
+"0","     main = ""Predicted LST"","
+"0","     xlab = ""Easting (m)"","
+"0","     ylab = ""Northing (m)"","
+"0","     axes = TRUE,"
+"0","     plg = list(title = ""LST (°C)"", shrink = 0.9))"

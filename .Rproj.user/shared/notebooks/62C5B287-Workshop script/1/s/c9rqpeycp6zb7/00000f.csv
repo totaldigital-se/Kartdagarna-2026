@@ -1,0 +1,10 @@
+"0","library(reticulate)"
+"0","py_config()"
+"1","python:         /cloud/project/.venv/bin/python
+libpython:      /usr/lib/python3.12/config-3.12-x86_64-linux-gnu/libpython3.12.so
+pythonhome:     /cloud/project/.venv:/cloud/project/.venv
+version:        3.12.11 (main, Sep 18 2025, 19:48:13) [Clang 20.1.4 ]
+numpy:           [NOT FOUND]
+
+NOTE: Python version was forced by RETICULATE_PYTHON
+"

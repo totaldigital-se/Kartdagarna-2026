@@ -1,0 +1,6 @@
+"0","fig, ax = plt.subplots() "
+"0","plt.sca(ax)"
+"0","shap.summary_plot(sv, Xe, show=False)"
+"0","plt.subplots_adjust(bottom=0.18)"
+"0","plt.show()"
+"0",""

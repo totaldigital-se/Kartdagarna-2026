@@ -1,0 +1,26 @@
+
+library(sf)
+library(dplyr)
+
+deso_raw <- st_read("./DeSO_Uppsala.gpkg", layer = "deso_2025", quiet = TRUE) |>
+  st_make_valid()
+
+# Municipality codes present in the local DeSO file (used for SCB population query below)
+(deso_koder <- deso_raw |>
+    st_drop_geometry() |>
+    distinct(desokod) |>
+    pull(desokod) |>
+    sort())
+
+
+library(pxweb)
+library(dplyr)
+
+url <- "https://api.scb.se/OV0104/v1/doris/sv/ssd/START/BE/BE0101/BE0101Y/FolkmDesoAldKon"
+
+meta <- pxweb_get(url)
+
+# See dimension codes (use these in the query)
+meta$variables |> purrr::map_chr("code")
+# Look at allowed values for a dimension, e.g. Region
+head(meta$variables[[which(purrr::map_chr(meta$variables, "code") == "Region")]]$values)

@@ -1,0 +1,6 @@
+"0","rf = RandomForestRegressor(n_estimators=100, max_features=""sqrt"", n_jobs=-1, random_state=42).fit(X_train, y_train)"
+"0",""
+"0","yp = rf.predict(X_test)"
+"0","print(f""Test RMSE: {mean_squared_error(y_test, yp):.3f}"")"
+"0","print(f""Test R²:   {r2_score(y_test, yp):.3f}"")"
+"0",""

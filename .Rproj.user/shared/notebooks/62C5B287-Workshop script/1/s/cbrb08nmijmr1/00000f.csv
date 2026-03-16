@@ -1,0 +1,6 @@
+"0","bg = X_train.sample(n=min(150, len(X_train)), random_state=42)  # background (reference distribution)"
+"0","Xe = X_test.sample(n=min(300, len(X_test)), random_state=42)    # evaluation sample"
+"0",""
+"0","expl = shap.TreeExplainer(rf, data=bg, feature_perturbation=""interventional"")"
+"0","sv = expl.shap_values(Xe)"
+"0",""

@@ -1,0 +1,32 @@
+{
+    "id": "B387B9AA",
+    "path": "/cloud/project/Workshop script.qmd",
+    "project_path": "Workshop script.qmd",
+    "type": "quarto_markdown",
+    "hash": "0",
+    "contents": "",
+    "dirty": true,
+    "created": 1771952551702.0,
+    "source_on_save": false,
+    "relative_order": 1,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "466,0",
+        "scrollLine": "0",
+        "ignored_words": "crs\n",
+        "rmdVisualMode": "true",
+        "rmdVisualCollapsedChunks": "",
+        "rmdVisualModeLocation": "2:0",
+        "docOutlineVisible": "1",
+        "rmdVisualWrapConfigured": "true"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1773237896,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1773245064376,
+    "read_only": false,
+    "read_only_alternatives": []
+}

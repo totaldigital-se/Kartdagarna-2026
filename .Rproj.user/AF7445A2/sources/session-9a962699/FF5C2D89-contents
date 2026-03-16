@@ -1,0 +1,763 @@
+---
+title: "Beyond the Syntax Wars: Uniting Python & R for disaster management"
+authors: "Hanna Swedenklef & Svetlana Serikova"
+format: html
+engine: knitr
+execute:
+  freeze: auto
+  cache: true
+---
+
+# Statistical downscaling of MODIS Land Surface Temperature with Machine Learning
+
+In this workshop we build a workflow to estimate high-resolution land surface temperature using satellite predictors and terrain information.
+
+Coarse LST products (e.g. MODIS) capture large-scale temperature patterns but miss local variation. Higher-resolution optical and terrain data contain information about land cover, moisture, elevation, and urban structure, which all influence surface temperature.
+
+The objective is to learn the relationship between LST and environmental predictors at coarse scale, and then apply that relationship to predict LST at finer resolution.
+
+## Phase 1: Let's configure Python inside project environment and load all necessary Python libraries.
+
+For that we need to execute these commands in the Terminal. Either run this code chunk, or you can paste each line and execute it separately in the terminal with Shift Insert.
+
+```{bash}
+cd /cloud/project
+
+rm -rf .venv
+
+python3 -m venv .venv
+
+source .venv/bin/activate
+
+python -m pip install -U pip wheel setuptools
+
+pip install numpy pandas matplotlib scipy scikit-learn \
+            xarray rasterio shapely rioxarray shap
+```
+
+Hopefully that went well and now we should be able to use both Python and R and switch between them without any problem.
+
+```{r}
+library(reticulate)
+py_config()
+```
+
+```{r}
+reticulate::py_run_string("import numpy, pandas, xarray, rioxarray, rasterio, shapely, scipy, sklearn, shap, matplotlib, functools, math")
+```
+
+The same step can be done using Python.
+
+```{python}
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+import rioxarray as rxr
+from rasterio.warp import Resampling
+from shapely.geometry import box
+
+from scipy.ndimage import convolve, gaussian_filter
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+
+import shap
+import matplotlib.pyplot as plt
+
+from functools import reduce
+from math import sqrt
+```
+
+## Phase 2: Train a ML model to predict LST at native MODIS resolution.
+
+We create a relationship between variables that we know influence urban heat (such as the proportion of vegetation, water or built-up land) with land surface temperature at MODIS native resolution (1000m).
+
+First, we load in the three data sources we need:
+
+1.  MODIS: a land surface temperature from 12:55 on 17/7 2025
+2.  A Sentinel-2 multispectral image composite from the month of July
+3.  A digital surface model (DSM), describing the terrain and heights of buildings
+
+The second two datasources have a naturally much higher resolution, but we resample it to the same resolution as the MODIS image so that we can analyze their relationship with our target variable (temperature).
+
+```{python}
+modis = rxr.open_rasterio("modelling_data/MODIS_images/MODIS_LST_20250717_1255.tif", masked=True).assign_coords(band=["LST"])
+
+s2    = rxr.open_rasterio("modelling_data/original_resolution/S2_composite.tif", masked=True).assign_coords(band=["B","G","R","NIR","SWIR1","SWIR2"])
+
+dsm   = rxr.open_rasterio("modelling_data/original_resolution/DSM.tif", masked=True).assign_coords(band=["DSM"])
+
+ds_modis = modis.to_dataset(dim="band")
+ds_s2 = s2.to_dataset(dim="band")
+ds_dsm = dsm.to_dataset(dim="band")
+
+# Combine into one dataset
+ds = xr.merge([ds_modis, ds_s2, ds_dsm])
+```
+
+Here we can see what our dataset (ds) contains. We see in the coordinates that it has both an x and y, and then several data variables.
+
+```{python}
+ds
+```
+
+To visualize them, we can plot some of the variables. We plot the LST (which is our target variable), as well as an RGB image of the study site and the elevation at the same resolution as the MODIS LST image.
+
+```{python}
+fig, ax = plt.subplots(1, 3, figsize=(12,4))
+
+ax[0].imshow(ds['LST'].values, cmap='inferno'); ax[0].set_title('LST')
+rgb = np.dstack([ds['R'].values, ds['G'].values, ds['B'].values])
+ax[1].imshow(rgb / np.nanmax(rgb)); ax[1].set_title('RGB')
+ax[2].imshow(ds['DSM'].values, cmap='terrain'); ax[2].set_title('DSM')
+
+[a.axis('off') for a in ax]
+plt.tight_layout(); plt.show()
+```
+
+Note, the gaps in the LST image are the areas that have been masked out due to cloud cover! We don't have cloud cover in the RGB image as it is a composite image, meaning it is a collection of many images throughout the month of July that have been stitched together to have continuous coverage.
+
+Next, we crop the dataset to the exact same extent.
+
+```{python}
+def common_bounds(das):
+    boxes = [box(*da.rio.bounds()) for da in das]
+    inter = reduce(lambda a,b: a.intersection(b), boxes)
+    return inter.bounds  # (minx,miny,maxx,maxy)
+
+# We choose representative layers that define footprint - LST, DSM and one layer from S2
+minx, miny, maxx, maxy = common_bounds([
+    ds["B"], ds["DSM"], ds["LST"]])
+
+ds = ds.rio.clip_box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
+```
+
+Now we derive **terrain variables** from the DSM.\
+- **Slope** measures how steep the surface is (degrees).\
+- **Aspect** is the direction of steepest downhill (degrees 0–360).\
+We also store `sin(aspect)` and `cos(aspect)` so aspect becomes a smooth (circular) predictor for ML.
+
+```{python}
+def slope_aspect(dsm: xr.DataArray):
+    # Pixel size (meters); abs() avoids sign conventions in the transform
+    xres, yres = map(abs, map(float, dsm.rio.resolution()))
+    z = dsm.values
+
+    # First derivatives (rise/run) in y and x
+    dz_dy, dz_dx = np.gradient(z, yres, xres)
+
+    # Slope: gradient magnitude -> angle (degrees)
+    slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
+
+    # Aspect: direction of steepest descent, normalized to [0, 360)
+    aspect = (np.degrees(np.arctan2(dz_dy, -dz_dx)) + 360) % 360
+
+    # Wrap back to DataArray and keep georeferencing
+    mk = lambda a: xr.DataArray(a, dims=dsm.dims, coords=dsm.coords)\
+                    .rio.write_crs(dsm.rio.crs).rio.write_transform(dsm.rio.transform())
+    return mk(slope), mk(aspect)
+
+slope, aspect = slope_aspect(ds["DSM"])
+ds["slope_dsm"]  = slope
+ds["aspect_sin"] = np.sin(np.deg2rad(aspect))
+ds["aspect_cos"] = np.cos(np.deg2rad(aspect))
+```
+
+We can also plot these newly generated features to see how they look across the study site.
+
+```{python}
+fig, ax = plt.subplots(1, 3, figsize=(12,4))
+
+ax[0].imshow(ds['slope_dsm'], cmap='viridis'); ax[0].set_title('Slope')
+ax[1].imshow(ds['aspect_sin'], cmap='RdBu'); ax[1].set_title('Aspect sin')
+ax[2].imshow(ds['aspect_cos'], cmap='RdBu'); ax[2].set_title('Aspect cos')
+
+[a.axis('off') for a in ax]
+plt.tight_layout(); plt.show()
+```
+
+### Spectral indices.
+
+In multispectral remote sensing, a band is a measurement of reflected energy in a specific wavelength range (e.g. green, red, near-infrared, shortwave infrared).\
+Different land-cover types reflect energy differently across wavelengths:
+
+-   vegetation strongly reflects **NIR** but absorbs **red**
+-   water absorbs **NIR and SWIR**
+-   built surfaces often reflect more evenly across visible–SWIR
+
+A spectral index combines two (or more) bands into a ratio that highlights these differences. Most indices are “normalized differences”:
+
+$$
+\frac{A - B}{A + B}
+$$
+
+This formulation:
+
+\- reduces effects of illumination and shadows
+\- makes values comparable across scenes
+\- produces unitless metrics typically between −1 and 1
+\- emphasizes specific surface properties (vegetation, water, urban materials)
+
+From a modeling perspective, indices often perform better than raw bands because they encode **physical relationships** rather than just reflectance values.
+
+**1. NDVI — Normalized Difference Vegetation Index**\
+Highlights vegetated surfaces (e.g., forests, crops, parks) by contrasting high NIR reflectance and low red reflectance.
+
+$$
+\mathrm{NDVI} = \frac{\mathrm{NIR} - \mathrm{R}}{\mathrm{NIR} + \mathrm{R}}
+$$
+
+High NDVI → dense vegetation.\
+Low/negative NDVI → bare soil, urban surfaces, water.
+
+**2. NDBI — Normalized Difference Built-up Index**\
+Emphasizes built-up and impervious surfaces.
+
+$$
+\mathrm{NDBI} = \frac{\mathrm{SWIR1} - \mathrm{NIR}}{\mathrm{SWIR1} + \mathrm{NIR}}
+$$
+
+Urban materials tend to reflect more in SWIR than in NIR.
+
+**3. MNDWI — Modified Normalized Difference Water Index**\
+Enhances open water and suppresses built surfaces and vegetation.
+
+$$
+\mathrm{MNDWI} = \frac{\mathrm{G} - \mathrm{SWIR1}}{\mathrm{G} + \mathrm{SWIR1}}
+$$
+
+Water absorbs SWIR strongly, producing high positive values.
+
+```{python}
+# Compute the three spectral indices
+ds["NDVI"]  = (ds["NIR"] - ds["R"]) / (ds["NIR"] + ds["R"])
+ds["NDBI"]  = (ds["SWIR1"] - ds["NIR"]) / (ds["SWIR1"] + ds["NIR"])
+ds["MNDWI"] = (ds["G"] - ds["SWIR1"]) / (ds["G"] + ds["SWIR1"])
+
+# Plot them for visual inspection
+fig, ax = plt.subplots(1, 3, figsize=(12,4))
+
+ax[0].imshow(ds['NDVI'], vmin=-1, vmax=1, cmap='RdYlGn'); ax[0].set_title('NDVI')
+ax[1].imshow(ds['NDBI'], vmin=-1, vmax=1, cmap='RdBu');   ax[1].set_title('NDBI')
+ax[2].imshow(ds['MNDWI'], vmin=-1, vmax=1, cmap='BrBG');  ax[2].set_title('MNDWI')
+
+[a.axis('off') for a in ax]
+plt.tight_layout(); plt.show()
+```
+
+### Local neighborhood (focal mean) predictors.
+
+Some relationships (e.g., moisture, vegetation, elevation) matter not just at a pixel, but in the **surrounding neighborhood**. We calculate the mean and standard deviation of the pixels in a surrounding neighborhood to provide context to the model.
+
+```{python}
+def focal_mean_nan(da: xr.DataArray, k: int = 9) -> xr.DataArray:
+    a = da.values
+    m = np.isfinite(a).astype(float)
+    a = np.nan_to_num(a, nan=0.0)
+
+    ker = np.ones((k, k), float)
+    s = convolve(a, ker, mode="nearest")
+    c = convolve(m, ker, mode="nearest")
+    mean = np.where(c > 0, s / c, np.nan)
+
+    out = xr.DataArray(mean, dims=da.dims, coords=da.coords, name=f"{da.name}_mean{k}")
+    return out.rio.write_crs(da.rio.crs).rio.write_transform(da.rio.transform())
+
+# Example: 9x9 pixel neighborhood means on the training grid
+ds["ndvi_mean9"]  = focal_mean_nan(ds["NDVI"],  9)
+ds["mndwi_mean9"] = focal_mean_nan(ds["MNDWI"], 9)
+ds["dsm_mean9"]   = focal_mean_nan(ds["DSM"],   9) 
+```
+
+### Build the machine-learning table (X) and target (y).
+
+Currently our data is structured as a multi-band raster, where we have each variable as a 'band' in our dataset. For our machine learning training, the Random Forest model expects a 2D table:
+
+\- `y`: the target LST (one value per pixel)
+\- `X`: predictors (one row per pixel, one column per feature), for example like:
+
+| LST | Red | Green | Blue | DEM | NDVI | ... and so on... |
+|-----|-----|-------|------|-----|------|------------------|
+| 35  |     |       |      |     |      | ...              |
+| 28  |     |       |      |     |      | ...              |
+| 22  |     |       |      |     |      | ...              |
+
+```{python}
+target = "LST"
+
+# Target vector
+y = ds[target].values.ravel()
+
+# Predictor table from all other variables
+preds = [v for v in ds.data_vars if v != target]
+X = pd.DataFrame({v: ds[v].values.ravel() for v in preds})
+
+# Keep only pixels where ALL predictors + target are finite
+ok = np.isfinite(np.c_[y, X.to_numpy()]).all(axis=1)
+X, y = X.loc[ok].reset_index(drop=True), y[ok]
+```
+
+### Train / test split.
+
+We hold out 20% of pixels for evaluation so we can check whether the model can predict accurately when it is shown new data that was not included in the training dataset.
+
+```{python}
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+```
+
+### Train Random Forest and evaluate.
+
+We fit the model, then report:
+
+\- **RMSE**: typical error magnitude (°C)
+\- **R²**: fraction of variance explained by our input variables
+
+```{python}
+rf = RandomForestRegressor(n_estimators=100, max_features="sqrt", n_jobs=-1, random_state=42).fit(X_train, y_train)
+
+yp = rf.predict(X_test)
+print(f"Test RMSE: {mean_squared_error(y_test, yp):.3f}")
+print(f"Test R²:   {r2_score(y_test, yp):.3f}")
+```
+
+### Explain the model with SHAP.
+
+SHAP estimates how much each feature contributes to predictions. We use small subsets for speed (SHAP can be computationally expensive on big rasters).
+
+```{python}
+bg = X_train.sample(n=min(200, len(X_train)), random_state=42)  # background (reference distribution)
+Xe = X_test.sample(n=min(500, len(X_test)), random_state=42)    # evaluation sample
+
+expl = shap.TreeExplainer(rf, data=bg, feature_perturbation="interventional")
+sv = expl.shap_values(Xe)
+```
+
+Plot SHAP results.
+
+```{python}
+fig, ax = plt.subplots() 
+plt.sca(ax)
+shap.summary_plot(sv, Xe, show=False)
+plt.subplots_adjust(bottom=0.18)
+plt.show()
+```
+
+Our result? Now we have a trained model.
+
+## Phase 3: Apply the trained model at a higher resolution.
+
+Now we know the relationship between the different factors and LST, so we can load in higher resolution data and predict at a finer grid resolution.
+
+We load higher-res Sentinel-2 + DSM, compute the same features, then predict.
+
+```{python}
+# Load hi-res predictors and force everything onto the S2 grid
+s2  = rxr.open_rasterio("modelling_data/target_resolution/S2_composite.tif", masked=True).assign_coords(band=["B","G","R","NIR","SWIR1","SWIR2"]).to_dataset("band")
+dsm = rxr.open_rasterio("modelling_data/target_resolution/DSM.tif", masked=True).isel(band=0, drop=True)
+ds_hi = xr.merge([s2, xr.Dataset({"DSM": dsm})]).rio.reproject_match(s2["B"])
+
+# Scale kernel so neighborhood (meters) matches training (e.g., 9px @ 1000 m)
+def scaled_kernel_size(train_res_m: float, pred_res_m: float, train_kernel: int) -> int:
+    k = int(round(train_kernel * (train_res_m / pred_res_m)))
+    return max(1, k + (k % 2 == 0))  # odd + >=1
+
+train_res_m = 1000.0
+pred_res_m  = abs(float(ds_hi["B"].rio.resolution()[0]))
+k9 = scaled_kernel_size(train_res_m, pred_res_m, 9)
+```
+
+### Recompute indices + terrain features on the high-res grid.
+
+These must match the training feature definitions.
+
+```{python}
+# Indices
+ds_hi["NDVI"]  = (ds_hi["NIR"]   - ds_hi["R"])     / (ds_hi["NIR"]   + ds_hi["R"])
+ds_hi["NDBI"]  = (ds_hi["SWIR1"] - ds_hi["NIR"])   / (ds_hi["SWIR1"] + ds_hi["NIR"])
+ds_hi["MNDWI"] = (ds_hi["G"]     - ds_hi["SWIR1"]) / (ds_hi["G"]     + ds_hi["SWIR1"])
+
+# DEM/DSM derivatives
+slope, asp = slope_aspect(ds_hi["DSM"])
+ds_hi["slope_dsm"]  = slope
+ds_hi["aspect_sin"] = np.sin(np.deg2rad(asp))
+ds_hi["aspect_cos"] = np.cos(np.deg2rad(asp))
+
+# Neighborhood means (scaled kernel)
+ds_hi["ndvi_mean9"]  = focal_mean_nan(ds_hi["NDVI"],  k9)
+ds_hi["mndwi_mean9"] = focal_mean_nan(ds_hi["MNDWI"], k9)
+ds_hi["dsm_mean9"]   = focal_mean_nan(ds_hi["DSM"],   k9)
+```
+
+### Add coordinate predictors and run high-res prediction.
+
+Function to predict.
+
+```{python}
+def predict_to_raster(ds_pred: xr.Dataset, model, ref: xr.DataArray, out_tif: str):
+    Xp = pd.DataFrame({f: ds_pred[f].values.ravel() for f in model.feature_names_in_})
+    ok = np.isfinite(Xp.to_numpy()).all(axis=1)
+
+    yhat = np.full(len(Xp), np.nan, np.float32)
+    yhat[ok] = model.predict(Xp.loc[ok]).astype(np.float32)
+
+    da = xr.DataArray(yhat.reshape(ref.shape), dims=ref.dims, coords=ref.coords, name="prediction") \
+           .rio.write_crs(ref.rio.crs).rio.write_transform(ref.rio.transform())
+    da.rio.to_raster(out_tif, compress="deflate", tiled=True, blockxsize=256, blockysize=256)
+    return da
+```
+
+Run predictions.
+
+```{python}
+pred_hi = predict_to_raster(ds_hi, rf, ds_hi["B"], "predicted_highres.tif")
+```
+
+Plot our predicted values.
+
+```{python}
+da = pred_hi 
+x = da["x"].values 
+y = da["y"].values 
+extent = [x.min(), x.max(), y.min(), y.max()] 
+
+fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
+im = ax.imshow(da.values, extent=extent, origin="upper", interpolation="nearest")
+
+cbar = fig.colorbar(im, ax=ax, shrink=0.9)
+cbar.set_label("LST (°C)")
+
+ax.set_xlabel("Easting (m)")
+ax.set_ylabel("Northing (m)", labelpad=20)
+ax.set_title("Predicted LST")
+ax.ticklabel_format(style="plain", axis="both")
+
+fig.savefig("predicted_highres.png", dpi=200, bbox_inches="tight")
+plt.show()
+```
+
+Can R read the output?
+Let's get some libraries and check.
+
+```{r}
+library(sf)
+library(terra)
+```
+
+```{r}
+pred <- rast("predicted_highres.tif")
+pred
+```
+
+Plot.
+
+```{r}
+plot(pred,
+     main = "Predicted LST",
+     xlab = "Easting (m)",
+     ylab = "Northing (m)",
+     axes = TRUE,
+     plg = list(title = "LST (°C)", shrink = 0.9))
+```
+
+Ok, looks identical. What about interactive html?
+For that we just need to reload tif with raster package instead of terra.
+
+```{r}
+library(raster)
+library(leaflet)
+library(leafem)
+library(htmlwidgets)
+
+pred <- raster("predicted_highres.tif")
+
+pal <- colorNumeric(
+  palette = viridisLite::viridis(256),
+  domain  = raster::values(pred),
+  na.color = "transparent")
+
+(m <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addRasterImage(pred, colors = pal, opacity = 0.85) %>%
+  addLegend(pal = pal, values = raster::values(pred), title = "LST (°C)"))
+```
+
+Fine. But what do these results mean? 
+
+```{r}
+# Create a quick histogram of values
+hist(values(pred), main = "Predicted LST distribution", xlab = "LST (°C)")
+```
+
+Looks like we have lots of very hot pixels.
+
+Shall we try to plot them together with SCB data to be able to use them in some meaningful way?
+
+Behold the SCB API.
+
+To work with APIs some extra libraries are needed.
+
+```{r}
+library(dplyr)
+library(stringr)
+library(httr2)
+library(purrr)
+library(xml2)
+```
+
+We will fetch DeSO codes that match Uppsala län from SCB WFS first because we want our data to be spatial too. Function to do it.
+
+```{r}
+tab_url <- "https://api.scb.se/OV0104/v1/doris/sv/ssd/BE/BE0101/BE0101A/BefolkningNy"
+wfs <- "https://geodata.scb.se/geoserver/stat/wfs"
+deso_typename <- "stat:DeSO_2025"
+lan_kod <- "03" # Uppsala län
+
+read_wfs_sf <- function(typename, cql_filter = NULL, srs = 3006) {
+  base <- paste0(
+    wfs,
+    "?service=WFS&version=2.0.0&request=GetFeature",
+    "&typeNames=", URLencode(typename, reserved = TRUE),
+    "&outputFormat=application/json",
+    "&srsName=EPSG:", srs
+  )
+  if (!is.null(cql_filter)) base <- paste0(base, "&cql_filter=", 
+                                           URLencode(cql_filter, reserved = TRUE))
+  st_read(base, quiet = TRUE)
+}
+```
+
+Let's fetch.
+
+```{r}
+deso <- read_wfs_sf(deso_typename, cql_filter = paste0("lanskod='", lan_kod, "'"), 
+                    srs = 3006) # all data for Uppsala län
+
+# Filter based on distinct codes so that we have only Håbo, Älvkarleby, Knivsta, Heby, Tierp, Uppsala, Enköping and Östhammar municipalities.
+(kom_koder <- deso |>
+  st_drop_geometry() |>
+  distinct(kommunkod) |>
+  pull(kommunkod) |>
+  sort())
+```
+
+Filter DeSO to only those municipalities.
+
+```{r}
+(deso <- deso |>
+  dplyr::group_by(kommunkod, kommunnamn) |>
+  dplyr::summarise(geometry = sf::st_union(geometry), .groups = "drop"))
+```
+
+Build an sf polygon of the raster extent in the same CRS.
+ 
+```{r}
+# We load again with terra
+pred <- rast("predicted_highres.tif")
+
+(roi <- st_as_sfc(st_bbox(pred), crs = st_crs(raster::crs(pred))) |> st_transform(3006))
+```
+
+Intersect, keep only the part of DeSO that is actually covered by the raster.
+
+```{r}
+deso <- st_intersection(deso, roi) |> filter(as.numeric(st_area(geometry)) > 2)
+```
+
+Plot.
+
+```{r}
+plot(deso)
+```
+
+Some annoying slivers remain after clipping. It would be great to get rid of those.
+
+```{r}
+tol <- 1  # 1 meter tolerance
+deso <- deso |>
+  mutate(geometry = st_buffer(st_buffer(geometry, tol), -tol)) |>
+  st_make_valid()
+plot(deso)
+```
+
+Much better. We can now proceed to experiment with some heat metrics.
+
+### DeSO heat metrics.
+
+Here we can extract all hot pixels above our arbitrary threshold and do some stats, like
+they total number, coverage and fraction to get a feeling what our results can tell us.
+
+```{r}
+library(exactextractr)
+   
+hot_thr   <- 30 # °C threshold               
+cell_area <- prod(res(pred)) # m² per pixel (here 250*250)
+
+# Exposure intensity: 95th percentile LST
+deso$lst_p95 <- exact_extract(
+  pred, deso,
+  function(values, coverage_fraction) {
+    v <- values[!is.na(values)]
+    if (length(v) == 0) return(NA_real_)
+    as.numeric(quantile(v, probs = 0.95, na.rm = TRUE, type = 7))
+  })
+
+# Mean LST of "hot" cells only >= threshold
+deso$lst_mean_hot <- exact_extract(
+  pred, deso,
+  function(values, coverage_fraction) {
+    ok <- !is.na(values) & values >= hot_thr
+    if (!any(ok)) return(NA_real_)
+    # coverage_fraction-weighted mean
+    sum(values[ok] * coverage_fraction[ok], na.rm = TRUE) /
+      sum(coverage_fraction[ok], na.rm = TRUE)
+  })
+
+# Exposure extent, fraction of covered area that is hot >= threshold
+deso$hot_area_m2 <- exact_extract(
+  pred, deso,
+  function(values, coverage_fraction) {
+    sum(coverage_fraction[!is.na(values) & values >= hot_thr], na.rm = TRUE) * cell_area
+  })
+
+deso$covered_area_m2 <- exact_extract(
+  pred, deso,
+  function(values, coverage_fraction) {
+    sum(coverage_fraction[!is.na(values)], na.rm = TRUE) * cell_area
+  })
+
+deso <- deso |>
+  mutate(
+    hot_frac_cov     = ifelse(covered_area_m2 > 0, hot_area_m2 / covered_area_m2, NA_real_),
+    hot_percent_cov  = round(100 * hot_frac_cov, 2))
+
+deso
+```
+
+Let's experiment with municipality heat exposure.
+SCB population.
+
+```{r}
+# SCB query
+query <- list(
+  query = list(
+    list(code = "Region", selection = list(filter = "item", values = as.list(kom_koder))),
+    list(code = "Alder",  selection = list(filter = "all",  values = list("*"))),
+    list(code = "Kon",    selection = list(filter = "item", values = list("1","2"))),
+    list(code = "ContentsCode", selection = list(filter = "item", values = list("BE0101N1"))),
+    list(code = "Tid",    selection = list(filter = "top",  values = list("1")))            
+  ),
+  response = list(format = "json")
+)
+
+px <- req_perform(
+  request(tab_url) |>
+    req_method("POST") |>
+    req_body_json(query)) |> resp_body_json()
+```
+
+Run the query and calculate some of the population metrics: elderly, young, their respective shares.
+
+```{r}
+(pop_kommun <- tibble(
+  key = map(px$data, "key"),
+  value = map_dbl(px$data, ~ as.numeric(.x$values[[1]]))
+) |>
+  transmute(
+    kommunkod = sprintf("%04d", as.integer(map_chr(key, 1))),
+    Alder  = map_chr(key, 2),
+    Kon    = map_chr(key, 3),
+    age = suppressWarnings(as.numeric(Alder)),
+    value
+  ) |>
+  filter(!is.na(age)) |>
+  group_by(kommunkod) |>
+  summarise(
+    pop_total   = sum(value, na.rm = TRUE),
+    pop_over70  = sum(value[age >= 70], na.rm = TRUE),
+    pop_under10 = sum(value[age <= 10], na.rm = TRUE),
+    share_over70  = pop_over70 / pop_total,
+    share_under10 = pop_under10 / pop_total,
+    .groups = "drop"
+  ))
+```
+
+Join population data to our spatial deso data.
+
+```{r}
+(deso <- deso |> left_join(pop_kommun, by = "kommunkod"))
+```
+
+```{r}
+# Hot intensity, mean exceedance (°C) among hot cells only
+deso$hot_exceed_mean <- exact_extract(
+  pred, deso,
+  function(values, coverage_fraction) {
+    ok <- !is.na(values) & values >= hot_thr
+    if (!any(ok)) return(0)  # define 0 if no hot cells
+    w <- coverage_fraction[ok]
+    v <- values[ok] - hot_thr
+    sum(v * w, na.rm = TRUE) / sum(w, na.rm = TRUE)
+  }
+)
+
+# Hot burden (°C * m²) = area-weighted exceedance
+deso$hot_exceed_burden <- exact_extract(
+  pred, deso,
+  function(values, coverage_fraction) {
+    ok <- !is.na(values) & values >= hot_thr
+    if (!any(ok)) return(0)
+    sum((values[ok] - hot_thr) * coverage_fraction[ok], na.rm = TRUE) * cell_area
+  }
+)
+
+deso <- deso |>
+    mutate(
+      elderly_exposure_proxy  = pop_over70  * hot_frac_cov,
+      children_exposure_proxy = pop_under10 * hot_frac_cov)
+
+(deso <- deso |>
+  mutate(
+    elderly_score = elderly_exposure_proxy * hot_exceed_mean,
+    children_score = children_exposure_proxy * hot_exceed_mean))
+```
+
+Map.
+
+```{r}
+deso <- deso |> st_transform(4326)
+
+pal_hotpct <- colorNumeric("YlOrRd", domain = deso$hot_percent_cov, na.color = "transparent")
+pal_meanhot <- colorNumeric("YlOrRd", domain = deso$lst_mean_hot, na.color = "transparent")
+pal_elderly <- colorNumeric("YlOrRd", domain = deso$elderly_exposure_proxy, na.color = "transparent")
+
+leaflet(deso) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+
+  addPolygons(
+    group = "Hot area (%)",
+    fillColor = ~pal_hotpct(hot_percent_cov),
+    fillOpacity = 0.5, color = "#444", weight = 1,
+    label = ~sprintf("%s: %.2f%% hot", kommunnamn, hot_percent_cov) |> lapply(htmltools::HTML)
+  ) |>
+
+  addPolygons(
+    group = "Mean hot LST (°C)",
+    fillColor = ~pal_meanhot(lst_mean_hot),
+    fillOpacity = 0.5, color = "#444", weight = 1,
+    label = ~sprintf("%s: mean hot %.2f°C", kommunnamn, lst_mean_hot) |> lapply(htmltools::HTML)
+  ) |>
+
+  addPolygons(
+    group = "Elderly exposure proxy",
+    fillColor = ~pal_elderly(elderly_exposure_proxy),
+    fillOpacity = 0.5, color = "#444", weight = 1,
+    label = ~sprintf("%s: proxy %.0f", kommunnamn, elderly_exposure_proxy) |> lapply(htmltools::HTML)
+  ) |>
+
+  addLayersControl(
+    overlayGroups = c("Hot area (%)", "Mean hot LST (°C)", "Elderly exposure proxy"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```

@@ -1,0 +1,2 @@
+"0","# Create a histogram of values"
+"0","hist(values(pred), main = ""Predicted LST distribution"", xlab = ""LST (°C)"")"
